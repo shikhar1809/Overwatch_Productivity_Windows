@@ -179,6 +179,13 @@ CREATE TABLE IF NOT EXISTS unlock_sessions (
   revoked INTEGER NOT NULL DEFAULT 0
 );
 ''');
+
+    try {
+      _db.execute('ALTER TABLE morning_sessions ADD COLUMN tasks_submitted INTEGER NOT NULL DEFAULT 0;');
+      _db.execute('ALTER TABLE morning_sessions ADD COLUMN tasks_submitted_at_ms INTEGER;');
+    } catch (_) {
+      // Columns already exist or altering fell through
+    }
   }
 
   static int basePointsForPriority(String priority) {
