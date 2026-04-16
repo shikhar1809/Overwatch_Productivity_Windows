@@ -1,0 +1,54 @@
+name: focus_os
+description: Focus OS v2 — discipline desktop shell (Flutter).
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  flutter_riverpod: ^2.6.1
+  go_router: ^14.6.2
+  window_manager: ^0.4.3
+  tray_manager: ^0.5.2
+  launch_at_startup: ^0.5.1
+  path: ^1.9.1
+  path_provider: ^2.1.5
+  sqlite3: ^2.5.0
+  sqlite3_flutter_libs: ^0.5.28
+  uuid: ^4.5.1
+  local_notifier: ^0.1.6
+  audioplayers: ^6.6.0
+  url_launcher: ^6.3.2
+  camera: ^0.12.0+1
+  camera_windows: ^0.2.6+4
+  flutter_litert: ^2.0.11
+  image: ^4.8.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  flutter_launcher_icons: ^0.14.4
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/tray_icon.png
+    - assets/logo.png
+
+flutter_launcher_icons:
+  android: false
+  ios: false
+  web:
+    generate: true
+    image_path: "assets/logo.png"
+    background_color: "transparent"
+    theme_color: "transparent"
+  windows:
+    generate: true
+    image_path: "assets/logo.png"
+    icon_size: 256
