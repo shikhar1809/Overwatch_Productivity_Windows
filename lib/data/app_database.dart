@@ -120,9 +120,25 @@ CREATE TABLE IF NOT EXISTS hall_of_shame (
   id TEXT NOT NULL PRIMARY KEY,
   day_id TEXT NOT NULL REFERENCES days(id) ON DELETE CASCADE,
   task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+  session_id TEXT,
   screenshot_path TEXT NOT NULL,
   reason TEXT NOT NULL,
   created_at_ms INTEGER NOT NULL
+);
+''');
+    _db.execute('''
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT NOT NULL PRIMARY KEY,
+  day_id TEXT NOT NULL REFERENCES days(id) ON DELETE CASCADE,
+  goal TEXT NOT NULL,
+  duration_minutes INTEGER NOT NULL,
+  started_at_ms INTEGER NOT NULL,
+  ended_at_ms INTEGER,
+  coverage_percent INTEGER,
+  points_earned INTEGER DEFAULT 0,
+  attended INTEGER NOT NULL DEFAULT 1,
+  remaining_seconds INTEGER,
+  slot_id TEXT
 );
 ''');
     _db.execute('''
@@ -339,6 +355,30 @@ VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0);
     return [for (final r in rows) SlotRow.fromRow(r)];
   }
 
+  SlotRow? getCurrentActiveSlot(String dayId) {
+    final now = DateTime.now();
+    final currentMinute = now.hour * 60 + now.minute;
+    
+    final rows = _db.select(
+      'SELECT * FROM slots WHERE day_id = ? AND committed = 1 AND start_minute <= ? AND end_minute >= ? ORDER BY start_minute DESC LIMIT 1;',
+      [dayId, currentMinute, currentMinute],
+    );
+    if (rows.isEmpty) return null;
+    return SlotRow.fromRow(rows.first);
+  }
+
+  SlotRow? getNextUpcomingSlot(String dayId) {
+    final now = DateTime.now();
+    final currentMinute = now.hour * 60 + now.minute;
+    
+    final rows = _db.select(
+      'SELECT * FROM slots WHERE day_id = ? AND committed = 1 AND start_minute > ? ORDER BY start_minute ASC LIMIT 1;',
+      [dayId, currentMinute],
+    );
+    if (rows.isEmpty) return null;
+    return SlotRow.fromRow(rows.first);
+  }
+
   void updateSlotTask(String slotId, String? taskId) {
     _db.prepare('UPDATE slots SET task_id = ? WHERE id = ? AND committed = 0;').execute([taskId, slotId]);
   }
@@ -354,6 +394,8 @@ VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0);
 
   void commitAllFilledSlots(String dayId) {
     final now = DateTime.now().millisecondsSinceEpoch;
+    
+    // Just commit all filled slots - don't merge consecutive ones
     _db.prepare('UPDATE slots SET committed = 1, committed_at_ms = ? WHERE day_id = ? AND task_id IS NOT NULL AND committed = 0;').execute([now, dayId]);
   }
 
@@ -535,15 +577,16 @@ ORDER BY v.ts_ms;
   void addHallOfShameEntry({
     required String dayId,
     String? taskId,
+    String? sessionId,
     required String screenshotPath,
     required String reason,
   }) {
     final id = _uuid.v4();
     final now = DateTime.now().millisecondsSinceEpoch;
     _db.prepare('''
-INSERT INTO hall_of_shame (id, day_id, task_id, screenshot_path, reason, created_at_ms)
-VALUES (?, ?, ?, ?, ?, ?);
-''').execute([id, dayId, taskId, screenshotPath, reason, now]);
+INSERT INTO hall_of_shame (id, day_id, task_id, session_id, screenshot_path, reason, created_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?);
+''').execute([id, dayId, taskId, sessionId, screenshotPath, reason, now]);
   }
 
   List<HallOfShameRow> listHallOfShameEntries() {
@@ -559,15 +602,132 @@ VALUES (?, ?, ?, ?, ?, ?);
     return [for (final r in rows) _hallOfShameFromRow(r)];
   }
 
+  List<HallOfShameRow> listHallOfShameForSession(String sessionId) {
+    final rows = _db.select(
+      'SELECT * FROM hall_of_shame WHERE session_id = ? ORDER BY created_at_ms;',
+      [sessionId],
+    );
+    return [for (final r in rows) _hallOfShameFromRow(r)];
+  }
+
   HallOfShameRow _hallOfShameFromRow(Row r) {
     return HallOfShameRow(
       id: r['id'] as String,
       dayId: r['day_id'] as String,
       taskId: r['task_id'] as String?,
+      sessionId: r['session_id'] as String?,
       screenshotPath: r['screenshot_path'] as String,
       reason: r['reason'] as String,
       createdAtMs: r['created_at_ms'] as int,
     );
+  }
+
+  // --- Sessions ---
+
+  String createSession({
+    required String dayId,
+    required String goal,
+    required int durationMinutes,
+    String? slotId,
+    int remainingSeconds = 0,
+  }) {
+    final id = _uuid.v4();
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _db.prepare('''
+INSERT INTO sessions (id, day_id, goal, duration_minutes, started_at_ms, attended, slot_id, remaining_seconds)
+VALUES (?, ?, ?, ?, ?, 1, ?, ?);
+''').execute([id, dayId, goal, durationMinutes, now, slotId, remainingSeconds]);
+    return id;
+  }
+
+  void updateSessionRemainingSeconds(String sessionId, int remainingSeconds) {
+    _db.prepare('UPDATE sessions SET remaining_seconds = ? WHERE id = ?;')
+        .execute([remainingSeconds, sessionId]);
+  }
+
+  void completeSession({
+    required String sessionId,
+    required int coveragePercent,
+  }) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final pointsEarned = coveragePercent;
+    _db.prepare('''
+UPDATE sessions SET ended_at_ms = ?, coverage_percent = ?, points_earned = ? WHERE id = ?;
+''').execute([now, coveragePercent, pointsEarned, sessionId]);
+  }
+
+  void markSessionMissed(String dayId) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final todayStart = DateTime.now();
+    final startOfDay = DateTime(todayStart.year, todayStart.month, todayStart.day);
+    final startMs = startOfDay.millisecondsSinceEpoch;
+    
+    final existing = _db.select(
+      'SELECT COUNT(*) as cnt FROM sessions WHERE day_id = ? AND attended = 1;',
+      [dayId],
+    );
+    
+    if ((existing.first['cnt'] as int) == 0) {
+      final id = _uuid.v4();
+      _db.prepare('''
+INSERT INTO sessions (id, day_id, goal, duration_minutes, started_at_ms, attended)
+VALUES (?, ?, 'Missed session', 0, ?, 0);
+''').execute([id, dayId, startMs]);
+    }
+  }
+
+  List<SessionRow> listSessionsForDay(String dayId) {
+    final rows = _db.select(
+      'SELECT * FROM sessions WHERE day_id = ? ORDER BY started_at_ms DESC;',
+      [dayId],
+    );
+    return [for (final r in rows) _sessionFromRow(r)];
+  }
+
+  List<SessionRow> listAllSessions() {
+    final rows = _db.select('SELECT * FROM sessions ORDER BY started_at_ms DESC;');
+    return [for (final r in rows) _sessionFromRow(r)];
+  }
+
+  SessionRow? getActiveSession(String dayId) {
+    final rows = _db.select(
+      'SELECT * FROM sessions WHERE day_id = ? AND ended_at_ms IS NULL ORDER BY started_at_ms DESC LIMIT 1;',
+      [dayId],
+    );
+    if (rows.isEmpty) return null;
+    return _sessionFromRow(rows.first);
+  }
+
+  SessionRow _sessionFromRow(Row r) {
+    return SessionRow(
+      id: r['id'] as String,
+      dayId: r['day_id'] as String,
+      goal: r['goal'] as String,
+      durationMinutes: r['duration_minutes'] as int,
+      startedAtMs: r['started_at_ms'] as int,
+      endedAtMs: r['ended_at_ms'] as int?,
+      coveragePercent: r['coverage_percent'] as int?,
+      pointsEarned: r['points_earned'] as int? ?? 0,
+      attended: (r['attended'] as int) != 0,
+      remainingSeconds: r['remaining_seconds'] as int?,
+      slotId: r['slot_id'] as String?,
+    );
+  }
+
+  int getTotalSessionPointsForDay(String dayId) {
+    final rows = _db.select(
+      'SELECT SUM(points_earned) as total FROM sessions WHERE day_id = ?;',
+      [dayId],
+    );
+    return (rows.first['total'] as int?) ?? 0;
+  }
+
+  int getAttendedSessionCountForDay(String dayId) {
+    final rows = _db.select(
+      'SELECT COUNT(*) as cnt FROM sessions WHERE day_id = ? AND attended = 1;',
+      [dayId],
+    );
+    return (rows.first['cnt'] as int?) ?? 0;
   }
 
   // --- Breaks ---
@@ -1155,6 +1315,7 @@ class HallOfShameRow {
     required this.id,
     required this.dayId,
     required this.taskId,
+    required this.sessionId,
     required this.screenshotPath,
     required this.reason,
     required this.createdAtMs,
@@ -1163,9 +1324,51 @@ class HallOfShameRow {
   final String id;
   final String dayId;
   final String? taskId;
+  final String? sessionId;
   final String screenshotPath;
   final String reason;
   final int createdAtMs;
 
   DateTime get createdAt => DateTime.fromMillisecondsSinceEpoch(createdAtMs);
+}
+
+class SessionRow {
+  SessionRow({
+    required this.id,
+    required this.dayId,
+    required this.goal,
+    required this.durationMinutes,
+    required this.startedAtMs,
+    required this.endedAtMs,
+    required this.coveragePercent,
+    required this.pointsEarned,
+    required this.attended,
+    this.remainingSeconds,
+    this.slotId,
+  });
+
+  final String id;
+  final String dayId;
+  final String goal;
+  final int durationMinutes;
+  final int startedAtMs;
+  final int? endedAtMs;
+  final int? coveragePercent;
+  final int pointsEarned;
+  final bool attended;
+  final int? remainingSeconds;
+  final String? slotId;
+
+  bool get isActive => endedAtMs == null;
+
+  DateTime get startedAt => DateTime.fromMillisecondsSinceEpoch(startedAtMs);
+  DateTime? get endedAt => endedAtMs != null ? DateTime.fromMillisecondsSinceEpoch(endedAtMs!) : null;
+
+  String get formattedDuration {
+    if (!attended) return 'MISSED';
+    final mins = endedAtMs != null 
+        ? ((endedAtMs! - startedAtMs) / 60000).round()
+        : durationMinutes;
+    return '${mins}min';
+  }
 }

@@ -184,4 +184,4 @@ class ViolationTrackerNotifier extends StateNotifier<ViolationTrackerState> {
 
 final monitorIntervalProvider = StateProvider<int>((ref) => 15);
 
-final isMonitorEnabledProvider = StateProvider<bool>((ref) => false);
+final isMonitorEnabledProvider = StateProvider<bool>((ref) => true);

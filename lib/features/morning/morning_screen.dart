@@ -285,6 +285,10 @@ class _MorningScreenState extends ConsumerState<MorningScreen> {
                 ref.invalidate(morningSessionProvider);
                 ref.invalidate(isDayStartedProvider);
                 ref.invalidate(todayScoreProvider);
+                ref.invalidate(todaySlotsProvider);
+                ref.invalidate(committedSlotsProvider);
+                ref.invalidate(currentActiveSlotProvider);
+                ref.invalidate(nextUpcomingSlotProvider);
                 
                 Future.microtask(() {
                   if (context.mounted) {

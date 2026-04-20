@@ -14,6 +14,7 @@ String _calendarDateToday() {
 }
 
 final todayDayIdProvider = Provider<String>((ref) {
+  ref.watch(sessionRefreshProvider);
   final db = ref.watch(appDatabaseProvider);
   return db.getOrCreateDayId(_calendarDateToday());
 });
@@ -46,6 +47,18 @@ final committedSlotsProvider = Provider<List<SlotRow>>((ref) {
   final db = ref.watch(appDatabaseProvider);
   final dayId = ref.watch(todayDayIdProvider);
   return db.listCommittedSlotsForDay(dayId);
+});
+
+final currentActiveSlotProvider = Provider<SlotRow?>((ref) {
+  final db = ref.watch(appDatabaseProvider);
+  final dayId = ref.watch(todayDayIdProvider);
+  return db.getCurrentActiveSlot(dayId);
+});
+
+final nextUpcomingSlotProvider = Provider<SlotRow?>((ref) {
+  final db = ref.watch(appDatabaseProvider);
+  final dayId = ref.watch(todayDayIdProvider);
+  return db.getNextUpcomingSlot(dayId);
 });
 
 final checklistItemsProvider = Provider<List<ChecklistItemRow>>((ref) {
@@ -142,4 +155,33 @@ final unhookVerifiedProvider = StateProvider<bool>((ref) => false);
 
 final activeUnlocksRefreshProvider = StateProvider<int>((ref) => 0);
 
+final isBlockingEnabledProvider = StateProvider<bool>((ref) => true);
+
 final themeProvider = StateProvider<bool>((ref) => false);
+
+final todaySessionsProvider = Provider<List<SessionRow>>((ref) {
+  final db = ref.watch(appDatabaseProvider);
+  final dayId = ref.watch(todayDayIdProvider);
+  return db.listSessionsForDay(dayId);
+});
+
+final activeSessionProvider = Provider<SessionRow?>((ref) {
+  final db = ref.watch(appDatabaseProvider);
+  final dayId = ref.watch(todayDayIdProvider);
+  return db.getActiveSession(dayId);
+});
+
+final isSessionActiveProvider = Provider<bool>((ref) {
+  ref.watch(sessionRefreshProvider);
+  final session = ref.watch(activeSessionProvider);
+  return session != null;
+});
+
+final todaySessionPointsProvider = Provider<int>((ref) {
+  ref.watch(sessionRefreshProvider);
+  final db = ref.watch(appDatabaseProvider);
+  final dayId = ref.watch(todayDayIdProvider);
+  return db.getTotalSessionPointsForDay(dayId);
+});
+
+final sessionRefreshProvider = StateProvider<int>((ref) => 0);

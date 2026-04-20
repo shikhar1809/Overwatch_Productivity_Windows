@@ -1,8 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import copy_metadata
 
 datas = []
 datas += collect_data_files('mediapipe')
+datas += collect_data_files('ultralytics')
+datas += copy_metadata('ultralytics')
 
 
 a = Analysis(
@@ -10,7 +13,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=[],
+    hiddenimports=['ultralytics', 'ultralytics.models', 'ultralytics.models.yolo', 'cv2', 'numpy'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -1,458 +1,366 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:audioplayers/audioplayers.dart';
-import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
-import 'package:image/image.dart' as img;
-import 'package:path/path.dart' as p;
-import 'package:flutter_litert/flutter_litert.dart';
 
-const _phoneClassId = 77;
-const _altPhoneClassId = 67;
-const _phoneConfidenceThreshold = 0.20;
-const _phoneDetectionThreshold = 2;
-const _normalCheckIntervalSeconds = 15;
-const _urgentCheckIntervalSeconds = 5;
-const _anyObjectThreshold = 0.50;
+/// A single timestamped log entry from the face monitor sidecar.
+class FaceLogEntry {
+  final String ts;
+  final String event;
+  final String msg;
+
+  const FaceLogEntry({
+    required this.ts,
+    required this.event,
+    required this.msg,
+  });
+
+  factory FaceLogEntry.fromJson(Map<String, dynamic> j) => FaceLogEntry(
+        ts: j['ts'] as String? ?? '',
+        event: j['event'] as String? ?? '',
+        msg: j['msg'] as String? ?? '',
+      );
+}
+
+/// Maps the Python sidecar `cause` string to a human-readable label.
+String _causeLabel(String? cause) {
+  switch (cause) {
+    case 'yolo_phone':
+    case 'yolo_phone_lap':
+      return '📱 Physical phone detected';
+    case 'gaze_pitch':
+      return '👇 Looking down (phone in lap)';
+    case 'head_yaw':
+      return '↔️ Head turned away from screen';
+    default:
+      return '⚠️ Distraction detected';
+  }
+}
+
+// ── Service ───────────────────────────────────────────────────────────────────
 
 class FaceMonitorService {
+  // ── internal state ─────────────────────────────────────────────────────────
   bool _initialized = false;
-  bool _isRunning = false;
+  bool _isRunning   = false;
   bool _alarmPlaying = false;
-  final List<bool> _recentDetections = [];
-  bool _phoneWasDetected = false;
 
-  String? _snapDir;
-  String? _modelPath;
-  Timer? _timer;
-  Timer? _statusTimer;
-  CameraController? _cameraController;
-  Interpreter? _interpreter;
-  bool _isBusy = false;
-  bool _modelReady = false;
-  int _consecutiveCameraErrors = 0;
-  int _cameraRetryDelay = 0;
-  bool _cameraReinitializing = false;
+  Process? _sidecar;
+  StreamSubscription<String>? _stdoutSub;
+  StreamSubscription<String>? _stderrSub;
 
   final AudioPlayer _audioPlayer = AudioPlayer();
   String? _soundPath;
-  String? _dayId;
-  void Function(String snapPath, String reason)? onPhoneDetected;
 
-  bool get isRunning => _isRunning;
+  void Function(String reason)? onPhoneDetected;
+
+  // ── public notifiers ───────────────────────────────────────────────────────
+  final ValueNotifier<String>           statusText       = ValueNotifier('Offline');
+  final ValueNotifier<int>              snapCount        = ValueNotifier(0);
+  final ValueNotifier<int>              focusScore       = ValueNotifier(100);
+  final ValueNotifier<Uint8List?>       previewFrame     = ValueNotifier(null);
+  final ValueNotifier<List<FaceLogEntry>> sessionLogs    = ValueNotifier(const []);
+  final ValueNotifier<bool>             isRunningNotifier = ValueNotifier(false);
+  /// Last distraction cause label (human-readable). Updated on every PHONE_DISTRACTION.
+  final ValueNotifier<String>           lastCause        = ValueNotifier('');
+
+  // ── public getters ─────────────────────────────────────────────────────────
+  bool get isRunning     => isRunningNotifier.value;
   bool get isAlarmPlaying => _alarmPlaying;
   bool get isInitialized => _initialized;
-  bool get isModelReady => _modelReady;
-  CameraController? get cameraController => _cameraController;
 
-  final ValueNotifier<String> statusText = ValueNotifier<String>('Offline');
-  final ValueNotifier<int> snapCount = ValueNotifier<int>(0);
-  int _totalSnaps = 0;
+  // ── initialize ─────────────────────────────────────────────────────────────
 
   Future<bool> initialize({
     required String soundPath,
     String? dayId,
-    void Function(String snapPath, String reason)? onPhoneDetectedCallback,
+    void Function(String reason)? onPhoneDetectedCallback,
   }) async {
-    if (_initialized) return true;
+    // Always update the callback — even if already initialised.
+    // This fixes the bug where toggling the monitor manually from Settings
+    // would set _initialized=true with NO callback, and any later call from
+    // SessionScreen would hit the early-return and never wire up the callback.
+    if (onPhoneDetectedCallback != null) {
+      onPhoneDetected = onPhoneDetectedCallback;
+    }
+
+    if (_initialized) return true;  // heavy setup only once
+
     _soundPath = soundPath;
-    _dayId = dayId;
-    onPhoneDetected = onPhoneDetectedCallback;
 
-    try {
-      _modelPath = r'C:\Users\royal\Documents\FocusOS\model\detect.tflite';
-      _snapDir = r'C:\Users\royal\Documents\FocusOS\snapshots';
-
-      await Directory(r'C:\Users\royal\Documents\FocusOS\model').create(recursive: true);
-      await Directory(_snapDir!).create(recursive: true);
-
-      statusText.value = 'Loading model...';
-      await _loadInterpreter();
-
-      if (!_modelReady) {
-        debugPrint('Face monitor: TFLite model failed to load');
-        statusText.value = 'Model error';
-        return false;
-      }
-
-      _initialized = true;
-      statusText.value = 'Ready - tap toggle to start';
-      debugPrint('Face monitor initialized successfully');
-      return true;
-    } catch (e, stack) {
-      debugPrint('Face monitor init error: $e');
-      statusText.value = 'Init error: $e';
+    // Verify the Python sidecar script exists
+    final scriptPath = _sidecarPath();
+    final scriptFile = File(scriptPath);
+    if (!scriptFile.existsSync()) {
+      statusText.value = 'Sidecar not found: $scriptPath';
+      debugPrint('FaceMonitor: sidecar missing at $scriptPath');
       return false;
     }
+
+    _initialized = true;
+    statusText.value = 'Ready — tap toggle to start';
+    debugPrint('FaceMonitor: initialized. Sidecar: $scriptPath');
+    return true;
   }
 
-  Future<void> _loadInterpreter() async {
-    try {
-      final modelFile = File(_modelPath!);
-      final exists = await modelFile.exists();
-      if (!exists) {
-        debugPrint('Model file not found at $_modelPath');
-        return;
-      }
-      
-      _interpreter = await Interpreter.fromFile(modelFile);
-      _modelReady = true;
-      debugPrint('TFLite interpreter loaded successfully');
-      
-      final inputs = _interpreter!.getInputTensors();
-      final outputs = _interpreter!.getOutputTensors();
-      String tinfo = "INPUTS:\n";
-      for (var t in inputs) tinfo += " - ${t.name}: ${t.shape} (type: ${t.type})\n";
-      tinfo += "OUTPUTS:\n";
-      for (var t in outputs) tinfo += " - ${t.name}: ${t.shape} (type: ${t.type})\n";
-      debugPrint(tinfo);
-    } catch (e, stack) {
-      debugPrint('TFLite load error: $e');
-      _modelReady = false;
-    }
-  }
+  // ── start ──────────────────────────────────────────────────────────────────
 
-  Future<void> start() async {
-    if (!_initialized || _isRunning) return;
+  Future<void> start({bool forceReconnect = false}) async {
+    if (!_initialized) return;
 
-    debugPrint('Starting face monitor...');
-    statusText.value = 'Initializing camera...';
-
-    _isRunning = true;
-    _recentDetections.clear();
-    _phoneWasDetected = false;
-    _consecutiveCameraErrors = 0;
-    _cameraRetryDelay = 0;
-    _cameraReinitializing = false;
-
-    await _ensureCameraInitialized();
-
-    _scheduleNextCheck(_normalCheckIntervalSeconds);
-
-    _statusTimer = Timer.periodic(const Duration(seconds: 1), (_timer) {
-      if (!_isRunning) {
-        _timer.cancel();
-        statusText.value = 'Face monitor offline';
-        return;
-      }
-      
-      if (_cameraReinitializing) {
-        statusText.value = 'Camera reconnecting...';
-      } else if (_isBusy) {
-        statusText.value = 'Analyzing frame...';
-      } else {
-        final interval = _phoneWasDetected ? _urgentCheckIntervalSeconds : _normalCheckIntervalSeconds;
-        final remaining = interval - (DateTime.now().second % interval);
-        statusText.value = _phoneWasDetected 
-            ? 'Phone detected! Checking in ${remaining}s...' 
-            : 'Active - next check in ${remaining}s';
-      }
-    });
-
-    debugPrint('Face monitor started successfully');
-  }
-
-  Future<void> _ensureCameraInitialized() async {
-    if (_cameraController != null && _cameraController!.value.isInitialized) {
-      return;
-    }
-
-    try {
-      statusText.value = 'Finding camera...';
-      final cameras = await availableCameras();
-      
-      if (cameras.isEmpty) {
-        debugPrint('No cameras found');
-        statusText.value = 'No camera found';
-        return;
-      }
-
-      debugPrint('Found ${cameras.length} camera(s)');
-      
-      await _initializeCameraController(cameras.first);
-    } catch (e) {
-      debugPrint('Camera initialization error: $e');
-      statusText.value = 'Camera error: $e';
-    }
-  }
-
-  Future<void> _initializeCameraController(CameraDescription camera) async {
-    if (_cameraController != null) {
+    // Check if sidecar is dead and needs restart
+    bool needsRestart = forceReconnect || _sidecar == null;
+    if (!needsRestart && _sidecar!.pid > 0) {
       try {
-        await _cameraController!.dispose();
-      } catch (_) {}
+        // Process is running, just arm
+        _sendArm(reconnect: forceReconnect);
+        return;
+      } catch (_) {
+        needsRestart = true;
+      }
     }
 
-    _cameraController = CameraController(
-      camera,
-      ResolutionPreset.medium,
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.jpeg,
-    );
+    _isRunning    = true;
+    _alarmPlaying = false;
+    isRunningNotifier.value = true;
+    focusScore.value  = 100;
+    sessionLogs.value = [];
+    snapCount.value   = 0;
+    statusText.value  = 'Starting sidecar…';
+
+    // Kill any existing zombie
+    if (_sidecar != null) {
+      try { _sidecar!.kill(); } catch (_) {}
+    }
 
     try {
-      await _cameraController!.initialize();
-      _consecutiveCameraErrors = 0;
-      _cameraRetryDelay = 0;
-      debugPrint('Camera initialized successfully');
-      statusText.value = 'Camera ready';
+      _sidecar = await Process.start(
+        'python',
+        [_sidecarPath()],
+        runInShell: true,
+      );
+
+      // stdout → JSON events
+      _stdoutSub = _sidecar!.stdout
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen(_onSidecarLine, onDone: _onSidecarDone);
+
+      // stderr → debug log only
+      _stderrSub = _sidecar!.stderr
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen((line) => debugPrint('[sidecar stderr] $line'));
+
+      debugPrint('FaceMonitor: sidecar process started (pid ${_sidecar!.pid})');
     } catch (e) {
-      debugPrint('Camera initialize failed: $e');
-      _cameraController = null;
-      rethrow;
+      debugPrint('FaceMonitor: failed to start sidecar: $e');
+      statusText.value = 'Error starting sidecar: $e';
+      _isRunning = false;
+      isRunningNotifier.value = false;
     }
   }
 
-  void _scheduleNextCheck(int seconds) {
-    _timer?.cancel();
-    _timer = Timer(Duration(seconds: seconds), () {
-      if (_isRunning) {
-        _check().then((_) {
-          final interval = _phoneWasDetected ? _urgentCheckIntervalSeconds : _normalCheckIntervalSeconds;
-          _scheduleNextCheck(interval);
-        });
-      }
-    });
+  void _sendArm({bool reconnect = false}) {
+    _sendCmd({'cmd': 'ARM', 'reconnect': reconnect});
+    _isRunning = true;
+    isRunningNotifier.value = true;
+    statusText.value = 'Monitoring face…';
   }
+
+  // ── stop ───────────────────────────────────────────────────────────────────
 
   void stop() {
-    _timer?.cancel();
-    _timer = null;
-    _statusTimer?.cancel();
-    _statusTimer = null;
+    if (!isRunningNotifier.value) return;
     _isRunning = false;
-    _recentDetections.clear();
-    _phoneWasDetected = false;
+    isRunningNotifier.value = false;
+    _sendCmd('DISARM');
     _stopAlarm();
-    _cleanup();
+    // Give the sidecar a moment to emit SESSION_SUMMARY, then kill it
+    Future.delayed(const Duration(milliseconds: 800), _killSidecar);
     statusText.value = 'Stopped';
-    debugPrint('Face monitor stopped');
+    debugPrint('FaceMonitor: stopped');
   }
 
-  void _cleanup() {
-    try { 
-      _cameraController?.dispose(); 
-    } catch (_) {}
-    _cameraController = null;
+  // ── dispose ────────────────────────────────────────────────────────────────
+
+  Future<void> dispose() async {
+    stop();
+    _killSidecar();
+    await _audioPlayer.dispose();
+    _initialized = false;
   }
 
-  Future<void> _check() async {
-    if (!_isRunning || _isBusy) return;
-    
-    if (_cameraReinitializing) {
-      debugPrint('Skipping check - camera reinitializing');
-      return;
-    }
-    
-    _isBusy = true;
-    bool phoneDetected = false;
-    String? lastSnapPath;
+  // ── sidecar comms ──────────────────────────────────────────────────────────
 
+  void _sendCmd(dynamic cmd) {
     try {
-      if (_cameraController == null || !_cameraController!.value.isInitialized) {
-        debugPrint('Camera not ready, attempting reinit...');
-        await _handleCameraError();
-        _isBusy = false;
-        return;
-      }
-
-      statusText.value = 'Capturing frame...';
-      
-      await Future.delayed(const Duration(milliseconds: 500));
-      
-      final xfile = await _cameraController!.takePicture();
-      _consecutiveCameraErrors = 0;
-      _cameraRetryDelay = 0;
-      
-      final bytes = await File(xfile.path).readAsBytes();
-
-      try { File(xfile.path).deleteSync(); } catch (_) {}
-
-      debugPrint('Captured frame (${bytes.length} bytes)');
-
-      if (_modelReady && _interpreter != null) {
-        statusText.value = 'Analyzing frame...';
-        debugPrint('Running inference...');
-        final result = await _runInference(bytes);
-        phoneDetected = result;
-        debugPrint('Inference complete. Phone detected: $phoneDetected');
-        
-        if (phoneDetected) {
-          debugPrint('Phone detected!');
-          _phoneWasDetected = true;
-          
-          final ts = DateTime.now().millisecondsSinceEpoch;
-          final snapPath = p.join(_snapDir!, 'phone_$ts.jpg');
-          await File(snapPath).writeAsBytes(bytes);
-          lastSnapPath = snapPath;
-          _totalSnaps++;
-          snapCount.value = _totalSnaps;
-          debugPrint('Saved phone snapshot: phone_$ts.jpg');
-        } else {
-          _phoneWasDetected = false;
-          debugPrint('No significant objects detected');
-        }
-      }
-
+      final payload = cmd is String ? {'cmd': cmd} : cmd as Map<String, dynamic>;
+      _sidecar?.stdin.writeln(jsonEncode(payload));
+      _sidecar?.stdin.flush();
     } catch (e) {
-      debugPrint('Face check error: $e');
-      await _handleCameraError();
-    } finally {
-      _isBusy = false;
-    }
-
-    _recentDetections.add(phoneDetected);
-    if (_recentDetections.length > 3) {
-      _recentDetections.removeAt(0);
-    }
-    
-    final hits = _recentDetections.where((d) => d).length;
-
-    if (phoneDetected) {
-      debugPrint('Recent phone hits: $hits/3 (Threshold: $_phoneDetectionThreshold)');
-    }
-
-    if (hits >= _phoneDetectionThreshold && !_alarmPlaying) {
-      statusText.value = 'PHONE DETECTED!';
-      _startAlarm();
-      
-      if (onPhoneDetected != null && lastSnapPath != null) {
-        onPhoneDetected!(lastSnapPath, 'Phone detected during focus session');
-      }
-    } else if (hits == 0) {
-      if (_alarmPlaying) {
-        _stopAlarm();
-        statusText.value = 'Phone removed - alarm stopped';
-      }
+      debugPrint('FaceMonitor: sendCmd($cmd) failed: $e');
     }
   }
 
-  Future<void> _handleCameraError() async {
-    if (_cameraReinitializing) return;
-
-    _consecutiveCameraErrors++;
-    debugPrint('Camera error count: $_consecutiveCameraErrors');
-
-    if (_consecutiveCameraErrors >= 2) {
-      _cameraReinitializing = true;
-      statusText.value = 'Camera error - reconnecting...';
-      
-      await Future.delayed(Duration(seconds: _cameraRetryDelay + 2));
-      _cameraRetryDelay = (_cameraRetryDelay + 2).clamp(0, 10);
-      
-      try {
-        await _ensureCameraInitialized();
-        debugPrint('Camera reinitialized successfully');
-      } catch (e) {
-        debugPrint('Camera reinit failed: $e');
-        statusText.value = 'Camera error - will retry';
-      } finally {
-        _cameraReinitializing = false;
-      }
-    }
-  }
-
-  Future<bool> _runInference(Uint8List jpegBytes) async {
+  void _killSidecar() {
+    _stdoutSub?.cancel();
+    _stderrSub?.cancel();
     try {
-      final image = img.decodeImage(jpegBytes);
-      if (image == null) {
-        debugPrint('Failed to decode image');
-        return false;
-      }
-      
-      final resized = img.copyResize(image, width: 300, height: 300);
+      _sendCmd('QUIT');
+    } catch (_) {}
+    try {
+      _sidecar?.kill(ProcessSignal.sigterm);
+    } catch (_) {}
+    _sidecar = null;
+  }
 
-      final inputTensor = List.generate(
-        300,
-        (y) => List.generate(300, (x) {
-          final pixel = resized.getPixel(x, y);
-          return [pixel.r.toInt(), pixel.g.toInt(), pixel.b.toInt()];
-        }),
-      );
-      final input = [inputTensor];
-
-      final outputBoxes = List.generate(1, (_) => List.generate(10, (_) => List.filled(4, 0.0)));
-      final outputClasses = List.generate(1, (_) => List.filled(10, 0.0));
-      final outputScores = List.generate(1, (_) => List.filled(10, 0.0));
-      final outputCount = List.filled(1, 0.0);
-
-      final outputs = {
-        0: outputBoxes,
-        1: outputClasses,
-        2: outputScores,
-        3: outputCount,
-      };
-
-      _interpreter!.runForMultipleInputs([input], outputs);
-
-      final count = outputCount[0].toInt().clamp(0, 10);
-      
-      String allDetections = 'Detections: ';
-      double maxNonPersonScore = 0;
-      
-      for (int i = 0; i < count; i++) {
-        final classId = outputClasses[0][i].toInt();
-        final score = outputScores[0][i];
-        
-        allDetections += '[class=$classId score=${score.toStringAsFixed(2)}] ';
-        
-        if (classId != 0 && score > maxNonPersonScore) {
-          maxNonPersonScore = score;
-        }
-        
-        if ((classId == _phoneClassId || classId == _altPhoneClassId) && score >= _phoneConfidenceThreshold) {
-          debugPrint('PHONE DETECTED! class=$classId score=${score.toStringAsFixed(2)}');
-          return true;
-        }
-      }
-      
-      debugPrint(allDetections.trim());
-      
-      if (maxNonPersonScore > _anyObjectThreshold) {
-        debugPrint('Non-person object detected (score: $maxNonPersonScore) - treating as phone');
-        return true;
-      }
-      
-      debugPrint('No significant objects detected');
-      return false;
-    } catch (e, stack) {
-      debugPrint('Inference error: $e');
-      return false;
+  void _onSidecarDone() {
+    debugPrint('FaceMonitor: sidecar stdout closed');
+    if (_isRunning) {
+      statusText.value = 'Sidecar disconnected';
+      _isRunning = false;
     }
   }
+
+  // ── event handling ─────────────────────────────────────────────────────────
+
+  void _onSidecarLine(String line) {
+    if (line.trim().isEmpty) return;
+    debugPrint('[sidecar] $line');
+
+    Map<String, dynamic> msg;
+    try {
+      msg = jsonDecode(line) as Map<String, dynamic>;
+    } catch (_) {
+      return; // not a JSON line
+    }
+
+    final event = msg['event'] as String?;
+    if (event == null) return;
+
+    switch (event) {
+      case 'READY':
+        statusText.value = 'Sidecar ready — arming…';
+        _sendArm();
+        break;
+
+      case 'STATUS':
+        final m = msg['msg'] as String? ?? '';
+        statusText.value = m;
+        break;
+
+      case 'PHONE_DISTRACTION':
+        final cause      = msg['cause'] as String?;
+        final causeLabel = _causeLabel(cause);
+        lastCause.value  = causeLabel;
+        statusText.value = '📵 $causeLabel';
+        snapCount.value  = snapCount.value + 1;
+        if (!_alarmPlaying) _startAlarm();
+        onPhoneDetected?.call(causeLabel);
+        break;
+
+      case 'ALARM_DISMISSED':
+        statusText.value = 'Alarm dismissed ✓';
+        _stopAlarm();
+        break;
+
+      case 'NO_FACE':
+        final secs = (msg['seconds'] as num?)?.toDouble() ?? 0;
+        statusText.value = '😶 No face for ${secs.toStringAsFixed(0)}s';
+        if (!_alarmPlaying) _startAlarm();
+        onPhoneDetected?.call('No face detected - empty state');
+        break;
+
+      case 'FACE_BACK':
+        statusText.value = 'Face detected — monitoring…';
+        if (_alarmPlaying) _stopAlarm();
+        break;
+
+      case 'FOCUS_SCORE':
+        _updateScore(msg);
+        break;
+
+      case 'SESSION_SUMMARY':
+        _updateScore(msg);
+        statusText.value = 'Session complete — score: ${focusScore.value}%';
+        break;
+
+      case 'FRAME':
+        final b64 = msg['b64'] as String?;
+        if (b64 != null) {
+          previewFrame.value = base64Decode(b64);
+        }
+        break;
+
+      case 'ERROR':
+        final m = msg['msg'] as String? ?? 'Unknown error';
+        debugPrint('FaceMonitor sidecar error: $m');
+        statusText.value = 'Sidecar error (see logs)';
+        break;
+    }
+  }
+
+  void _updateScore(Map<String, dynamic> msg) {
+    final score = (msg['score'] as num?)?.toInt() ?? focusScore.value;
+    focusScore.value = score.clamp(0, 100);
+
+    final rawLogs = msg['logs'] as List<dynamic>?;
+    if (rawLogs != null) {
+      final entries = rawLogs
+          .whereType<Map<String, dynamic>>()
+          .map(FaceLogEntry.fromJson)
+          .toList();
+      // newest first
+      sessionLogs.value = entries.reversed.toList();
+    }
+  }
+
+  // ── alarm ──────────────────────────────────────────────────────────────────
 
   void _startAlarm() {
     if (_soundPath == null || _alarmPlaying) return;
-    
     try {
       _alarmPlaying = true;
       _audioPlayer.setReleaseMode(ReleaseMode.loop);
       _audioPlayer.play(DeviceFileSource(_soundPath!));
-      debugPrint('ALARM STARTED - phone detected');
+      debugPrint('FaceMonitor: alarm started');
     } catch (e) {
-      debugPrint('Alarm playback error: $e');
+      debugPrint('FaceMonitor: alarm play error: $e');
       _alarmPlaying = false;
     }
   }
 
   void _stopAlarm() {
     if (!_alarmPlaying) return;
-    
     try {
       _alarmPlaying = false;
       _audioPlayer.stop();
-      debugPrint('Alarm stopped');
+      debugPrint('FaceMonitor: alarm stopped');
     } catch (e) {
-      debugPrint('Alarm stop error: $e');
+      debugPrint('FaceMonitor: alarm stop error: $e');
     }
   }
 
-  Future<void> dispose() async {
-    stop();
-    _interpreter?.close();
-    await _audioPlayer.dispose();
-    _initialized = false;
+  // ── path helper ────────────────────────────────────────────────────────────
+
+  static String _sidecarPath() {
+    // Resolve relative to the executable / project root at runtime.
+    // In debug: project root is the CWD when running `flutter run`.
+    // In release: exe lives in build/windows/x64/runner/Release/
+    // We walk up until we find python_sidecar/detector.py.
+    final candidates = [
+      r'c:\Users\royal\Desktop\Productive\focus_os\python_sidecar\detector.py',
+      'python_sidecar/detector.py',
+      '../python_sidecar/detector.py',
+      '../../python_sidecar/detector.py',
+    ];
+    for (final c in candidates) {
+      if (File(c).existsSync()) return c;
+    }
+    // Default absolute path (works during development)
+    return r'c:\Users\royal\Desktop\Productive\focus_os\python_sidecar\detector.py';
   }
 }

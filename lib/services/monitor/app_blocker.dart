@@ -13,6 +13,8 @@ class AppBlocker {
     'tiktok',
     '9gag',
     'reddit',
+    'linkedin',
+    'whatsapp',
   ];
 
   static const _alwaysBlockedProcesses = [

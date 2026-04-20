@@ -96,8 +96,12 @@ class ViolationDetector {
   String get lastStatusReason => _lastStatusReason;
 
   Future<void> initialize() async {
-    // Initialize face monitor (gracefully degrades if sidecar exe is missing)
-    await faceMonitor.initialize(soundPath: _soundPath);
+    // NOTE: Do NOT pre-initialize faceMonitor here.
+    // FaceMonitorService requires an onPhoneDetectedCallback that captures
+    // AppDatabase + dayId — context only available in UI screens.
+    // Initialization is deferred to MonitorSettingsScreen / SessionScreen,
+    // both of which call faceMonitor.initialize() with the correct callback.
+    debugPrint('ViolationDetector: ready (face monitor deferred to UI).');
   }
 
   void startMonitoring({

@@ -7,6 +7,11 @@ class BlockingConstants {
     'graph.instagram.com',
   ];
 
+  static const List<String> linkedinDomains = [
+    'linkedin.com',
+    'www.linkedin.com',
+  ];
+
   static const List<String> youtubeDomains = [
     'youtube.com',
     'www.youtube.com',
@@ -19,6 +24,7 @@ class BlockingConstants {
 
   static const List<String> defaultBlockedDomains = [
     ...instagramDomains,
+    ...linkedinDomains,
   ];
 
   static const List<String> socialMediaDomains = [
@@ -75,6 +81,13 @@ class AppInfo {
       id: 'instagram',
       name: 'Instagram',
       domains: BlockingConstants.instagramDomains,
+      category: 'Social Media',
+      isHardBlocked: true,
+    ),
+    AppInfo(
+      id: 'linkedin',
+      name: 'LinkedIn',
+      domains: BlockingConstants.linkedinDomains,
       category: 'Social Media',
       isHardBlocked: true,
     ),

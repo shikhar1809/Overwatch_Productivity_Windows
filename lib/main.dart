@@ -14,6 +14,8 @@ import 'package:local_notifier/local_notifier.dart';
 import 'app.dart';
 import 'data/app_database.dart';
 import 'data/providers.dart';
+import 'services/blocking/windows_blocking.dart';
+import 'services/blocking/blocking_constants.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -45,6 +47,7 @@ Future<void> main() async {
 
   await _initTray();
   await _initLaunchAtStartup();
+  await _initBlocking(db);
 
   runApp(
     ProviderScope(
@@ -87,7 +90,43 @@ Future<void> _initLaunchAtStartup() async {
       args: const [],
     );
     await launchAtStartup.enable();
-  } on Object {
-    // Elevation or policy may block autostart; non-fatal for Phase 1.
+    final isEnabled = await launchAtStartup.isEnabled();
+    print('[Startup] Auto-start enabled: $isEnabled');
+  } on Object catch (e) {
+    print('[Startup] Failed to enable auto-start: $e');
+  }
+}
+
+Future<void> _initBlocking(AppDatabase db) async {
+  if (!Platform.isWindows) return;
+  try {
+    final blockingService = WindowsBlockingService();
+    await blockingService.initialize();
+    
+    final hasPermissions = await blockingService.hasElevatedPermissions();
+    if (!hasPermissions) {
+      await blockingService.requestElevatedPermissions();
+    }
+
+    final hardBlocked = db.listHardBlockedApps();
+    if (hardBlocked.isEmpty) {
+      for (final app in AppInfo.predefinedApps.where((a) => a.isHardBlocked)) {
+        db.addBlockingRule(
+          appId: app.id,
+          appName: app.name,
+          category: app.category,
+          domains: app.domains,
+          isHardBlocked: app.isHardBlocked,
+          requiresUnhook: false,
+        );
+      }
+    }
+
+    final rules = db.listHardBlockedApps();
+    final domains = rules.expand((r) => r.domains).toList();
+    await blockingService.applyBlocks(domains);
+    print('[Blocking] Initialized with ${rules.length} hard-blocked apps');
+  } on Object catch (e) {
+    print('[Blocking] Failed to initialize: $e');
   }
 }

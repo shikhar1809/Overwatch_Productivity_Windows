@@ -8,7 +8,13 @@ import 'package:window_manager/window_manager.dart';
 import 'core/theme/app_theme.dart';
 import 'data/providers.dart';
 import 'router/app_router.dart';
+import 'services/monitor/violation_detector.dart';
+import 'services/monitor/violation_tracker.dart';
 import 'services/timeline/timeline_service.dart';
+
+final violationDetectorSingletonProvider = Provider<ViolationDetector>((ref) {
+  return ViolationDetector();
+});
 
 class FocusOSApp extends ConsumerStatefulWidget {
   const FocusOSApp({super.key});
@@ -22,8 +28,30 @@ class _FocusOSAppState extends ConsumerState<FocusOSApp> with TrayListener {
   void initState() {
     super.initState();
     trayManager.addListener(this);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
       ref.read(timelineServiceProvider).start();
+      final isEnabled = ref.read(isMonitorEnabledProvider);
+      if (isEnabled) {
+        final detector = ref.read(violationDetectorSingletonProvider);
+        final dayId = ref.read(todayDayIdProvider);
+        
+        await detector.faceMonitor.initialize(
+          soundPath: r'c:\Users\royal\Desktop\Productive\Phone_Sound_Effect.mp3',
+          dayId: dayId,
+          onPhoneDetectedCallback: (reason) {
+            final db = ref.read(appDatabaseProvider);
+            db.addHallOfShameEntry(
+              dayId: dayId,
+              screenshotPath: 'face_${DateTime.now().millisecondsSinceEpoch}.log',
+              reason: reason,
+            );
+          },
+        );
+        detector.startMonitoring(
+          taskId: 'auto_start',
+          taskName: 'Focus Mode',
+        );
+      }
     });
   }
 

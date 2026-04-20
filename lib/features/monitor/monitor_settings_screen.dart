@@ -1,25 +1,17 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../app.dart';
 import '../../core/theme/theme_extensions.dart';
 import '../../data/app_database.dart';
 import '../../data/providers.dart';
 import '../../services/monitor/app_blocker.dart';
 import '../../services/monitor/violation_detector.dart';
 import '../../services/monitor/violation_tracker.dart';
-
-// ── Singleton provider ────────────────────────────────────────────────────────
-
-final violationDetectorSingletonProvider = Provider<ViolationDetector>((ref) {
-  final d = ViolationDetector();
-  ref.onDispose(d.dispose);
-  return d;
-});
-
-// ── Screen ────────────────────────────────────────────────────────────────────
 
 class MonitorSettingsScreen extends ConsumerStatefulWidget {
   const MonitorSettingsScreen({super.key});
@@ -45,7 +37,6 @@ class _MonitorSettingsScreenState
       if (mounted) setState(() => _status = s);
     });
 
-    // Refresh live data every 2s even without monitoring
     Timer.periodic(const Duration(seconds: 2), (_) {
       if (!mounted) return;
       if (!detector.isMonitoring) {
@@ -70,13 +61,13 @@ class _MonitorSettingsScreenState
     await detector.faceMonitor.initialize(
       soundPath: r'c:\Users\royal\Desktop\Productive\Phone_Sound_Effect.mp3',
       dayId: dayId,
-      onPhoneDetectedCallback: (snapPath, reason) {
+      onPhoneDetectedCallback: (reason) {
         db.addHallOfShameEntry(
           dayId: dayId,
-          screenshotPath: snapPath,
+          screenshotPath: 'face_${DateTime.now().millisecondsSinceEpoch}.log',
           reason: reason,
         );
-        debugPrint('Phone detection saved to Hall of Shame');
+        debugPrint('FaceMesh distraction saved to Hall of Shame');
       },
     );
     
@@ -88,8 +79,12 @@ class _MonitorSettingsScreenState
 
   @override
   Widget build(BuildContext context) {
+    ref.watch(sessionRefreshProvider);
     final interval = ref.watch(monitorIntervalProvider);
     final isEnabled = ref.watch(isMonitorEnabledProvider);
+    final dayStarted = ref.watch(isDayStartedProvider) || ref.watch(areTasksSubmittedProvider);
+    final sessionActive = ref.watch(isSessionActiveProvider);
+    final locked = dayStarted || sessionActive;
     final detector = ref.read(violationDetectorSingletonProvider);
     final blocker = detector.blocker;
 
@@ -102,7 +97,6 @@ class _MonitorSettingsScreenState
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // ── Header ──────────────────────────────────────────────────────────
           Row(
             children: [
               Column(
@@ -149,37 +143,31 @@ class _MonitorSettingsScreenState
           ),
           const SizedBox(height: 24),
 
-          // ── Live Status ──────────────────────────────────────────────────────
-          _buildLiveStatus(context),
+          _buildLiveStatus(context, detector),
           const SizedBox(height: 24),
 
-          // ── Master Toggle ────────────────────────────────────────────────────
-          _buildToggle(context, isEnabled, detector),
+          _buildToggle(context, isEnabled, locked, detector),
           const SizedBox(height: 24),
 
-          // ── Task Mode ────────────────────────────────────────────────────────
           _buildTaskMode(context, blocker),
           const SizedBox(height: 24),
 
-          // ── Face Monitor ─────────────────────────────────────────────────────
-          _buildFaceMonitor(context, detector),
+          _buildWebsiteBlocking(context),
           const SizedBox(height: 24),
 
-          // ── Check Interval ───────────────────────────────────────────────────
-          _buildIntervalSlider(context, interval, detector),
+          _buildFaceMonitor(context, detector, locked),
           const SizedBox(height: 24),
 
-          // ── What's Blocked ───────────────────────────────────────────────────
+          _buildIntervalSlider(context, interval, locked, detector),
+          const SizedBox(height: 24),
+
           _buildWhatIsBlocked(context, blocker),
         ],
       ),
     );
   }
 
-  // ── Live Status Card ────────────────────────────────────────────────────────
-
-  Widget _buildLiveStatus(BuildContext context) {
-    final detector = ref.read(violationDetectorSingletonProvider);
+  Widget _buildLiveStatus(BuildContext context, ViolationDetector detector) {
     final window = _status?.activeWindow.isNotEmpty == true
         ? _status!.activeWindow
         : detector.lastActiveWindow.isNotEmpty
@@ -278,10 +266,8 @@ class _MonitorSettingsScreenState
     );
   }
 
-  // ── Toggle ──────────────────────────────────────────────────────────────────
-
   Widget _buildToggle(
-      BuildContext context, bool isEnabled, ViolationDetector detector) {
+      BuildContext context, bool isEnabled, bool locked, ViolationDetector detector) {
     return Card(
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -308,11 +294,14 @@ class _MonitorSettingsScreenState
                   Text('Block & Monitor',
                       style: Theme.of(context).textTheme.titleSmall),
                   Text(
-                    isEnabled
-                        ? 'Actively blocking distractions'
-                        : 'Monitoring is off',
-                    style: const TextStyle(
-                        fontSize: 12, color: Colors.grey),
+                    locked
+                        ? 'Locked ON during session'
+                        : isEnabled
+                            ? 'Actively blocking distractions'
+                            : 'Monitoring is off',
+                    style: TextStyle(
+                        fontSize: 12,
+                        color: locked ? Colors.green : Colors.grey),
                   ),
                 ],
               ),
@@ -320,93 +309,26 @@ class _MonitorSettingsScreenState
             Switch(
               value: isEnabled,
               activeColor: Colors.green,
-              onChanged: (v) async {
-                if (v) {
-                  ref.read(isMonitorEnabledProvider.notifier).state = true;
-                  detector.startMonitoring(
-                    taskId: 'manual',
-                    taskName: 'Focus Mode',
-                  );
-                } else {
-                  final dayStarted = ref.read(isDayStartedProvider) || ref.read(areTasksSubmittedProvider);
-                  if (dayStarted) {
-                    final result = await _showLockBreakDialog();
-                    if (result != true) return;
-                  }
-                  ref.read(isMonitorEnabledProvider.notifier).state = false;
-                  detector.stopMonitoring();
-                }
-              },
+              onChanged: locked
+                  ? null
+                  : (v) async {
+                      if (v) {
+                        ref.read(isMonitorEnabledProvider.notifier).state = true;
+                        detector.startMonitoring(
+                          taskId: 'manual',
+                          taskName: 'Focus Mode',
+                        );
+                      } else {
+                        ref.read(isMonitorEnabledProvider.notifier).state = false;
+                        detector.stopMonitoring();
+                      }
+                    },
             ),
           ],
         ),
       ),
     );
   }
-
-  Future<bool> _showLockBreakDialog() async {
-    final controller = TextEditingController();
-    bool success = false;
-    await showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Break The Loop?', style: TextStyle(color: Colors.red)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Your day is locked. You cannot modify overwatch rules without breaking the pattern.',
-              style: TextStyle(fontWeight: FontWeight.w500),
-            ),
-            const SizedBox(height: 16),
-            const Text('To terminate monitoring, type exactly:'),
-            const SizedBox(height: 8),
-            Container(
-              padding: const EdgeInsets.all(8),
-              color: Colors.grey.withValues(alpha: 0.1),
-              child: const Text(
-                'BREAK THE LOOP NOW OR THE PATTERN WILL CONTINUE TOMMOROW',
-                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, letterSpacing: 0.5),
-              ),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: controller,
-              decoration: const InputDecoration(
-                border: OutlineInputBorder(),
-                hintText: 'Type phrase here...',
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: Colors.red),
-            onPressed: () {
-              if (controller.text.trim() == 'BREAK THE LOOP NOW OR THE PATTERN WILL CONTINUE TOMMOROW') {
-                success = true;
-                Navigator.of(ctx).pop();
-              } else {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Incorrect phrase. The pattern remains unbroken.'), backgroundColor: Colors.red),
-                );
-              }
-            },
-            child: const Text('Terminate'),
-          ),
-        ],
-      ),
-    );
-    return success;
-  }
-
-  // ── Task Mode ───────────────────────────────────────────────────────────────
 
   Widget _buildTaskMode(BuildContext context, AppBlocker blocker) {
     return Card(
@@ -437,7 +359,7 @@ class _MonitorSettingsScreenState
                 Expanded(
                   child: _modeChip(
                     context,
-                    label: '💻 DSA / Coding',
+                    label: 'DSA / Coding',
                     subtitle: 'LeetCode, algorithms, programming',
                     selected: blocker.mode == TaskMode.dsa,
                     onTap: () =>
@@ -448,7 +370,7 @@ class _MonitorSettingsScreenState
                 Expanded(
                   child: _modeChip(
                     context,
-                    label: '📚 College Studies',
+                    label: 'College Studies',
                     subtitle: 'Lectures, tutorials, courses',
                     selected: blocker.mode == TaskMode.college,
                     onTap: () =>
@@ -472,6 +394,96 @@ class _MonitorSettingsScreenState
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildWebsiteBlocking(BuildContext context) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.block, size: 20),
+                const SizedBox(width: 8),
+                Text('Custom Blocked Websites',
+                    style: Theme.of(context).textTheme.titleMedium),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'Add websites to block during focus sessions.',
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: Colors.grey),
+            ),
+            const SizedBox(height: 14),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _blockedSiteChip('linkedin.com'),
+                _blockedSiteChip('whatsapp.com'),
+                _blockedSiteChip('facebook.com'),
+                _blockedSiteChip('twitter.com'),
+                _blockedSiteChip('reddit.com'),
+                _blockedSiteChip('tiktok.com'),
+              ],
+            ),
+            const SizedBox(height: 14),
+            ElevatedButton.icon(
+              onPressed: () => _showAddWebsiteDialog(context),
+              icon: const Icon(Icons.add),
+              label: const Text('Add Website'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _blockedSiteChip(String site) {
+    return Chip(
+      label: Text(site, style: const TextStyle(fontSize: 12)),
+      backgroundColor: Colors.red.withValues(alpha: 0.1),
+      labelStyle: const TextStyle(color: Colors.red),
+      deleteIcon: const Icon(Icons.close, size: 16),
+      onDeleted: () {},
+    );
+  }
+
+  void _showAddWebsiteDialog(BuildContext context) {
+    final controller = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Add Website to Block'),
+        content: TextField(
+          controller: controller,
+          decoration: const InputDecoration(
+            labelText: 'Website domain',
+            hintText: 'e.g., example.com',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              if (controller.text.isNotEmpty) {
+                Navigator.pop(ctx);
+              }
+            },
+            child: const Text('Add'),
+          ),
+        ],
       ),
     );
   }
@@ -518,13 +530,10 @@ class _MonitorSettingsScreenState
     );
   }
 
-  // ── Face Monitor ────────────────────────────────────────────────────────────
-
   Widget _buildFaceMonitor(
-      BuildContext context, ViolationDetector detector) {
-    final ready   = detector.faceMonitor.isInitialized;
-    final running = detector.faceMonitor.isRunning;
-
+      BuildContext context, ViolationDetector detector, bool locked) {
+    final fm = detector.faceMonitor;
+    
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -533,33 +542,38 @@ class _MonitorSettingsScreenState
           children: [
             Row(
               children: [
-                const Icon(Icons.phonelink_erase_outlined,
+                const Icon(Icons.face_retouching_natural,
                     size: 20, color: Colors.deepPurple),
                 const SizedBox(width: 8),
-                Text('Phone Detector',
+                Text('FaceMesh Monitor',
                     style: Theme.of(context).textTheme.titleMedium),
                 const Spacer(),
-                if (running)
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 10, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: Colors.green.withValues(alpha: 0.12),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: const Text('ACTIVE',
-                        style: TextStyle(
-                            color: Colors.green,
-                            fontSize: 11,
-                            fontWeight: FontWeight.bold)),
-                  ),
+                ValueListenableBuilder<bool>(
+                  valueListenable: fm.isRunningNotifier,
+                  builder: (_, running, __) {
+                    if (!running) return const SizedBox.shrink();
+                    return Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: Colors.green.withValues(alpha: 0.12),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: const Text('ACTIVE',
+                          style: TextStyle(
+                              color: Colors.green,
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold)),
+                    );
+                  },
+                ),
               ],
             ),
             const SizedBox(height: 8),
             Text(
-              'Uses your webcam to detect phones via MediaPipe AI. '
-              'Phone seen 3× in a row → alarm. '
-              'Raise both hands & face camera to dismiss.',
+              'Detects phone distractions via head-pose + gaze direction. '
+              'Raise both hands to dismiss alarm. '
+              'Tracks desk absence & focus score per session.',
               style: Theme.of(context)
                   .textTheme
                   .bodySmall
@@ -576,130 +590,175 @@ class _MonitorSettingsScreenState
                           ? const SizedBox(
                               width: 18,
                               height: 18,
-                              child:
-                                  CircularProgressIndicator(strokeWidth: 2),
+                              child: CircularProgressIndicator(strokeWidth: 2),
                             )
-                          : Icon(
-                              running
-                                  ? Icons.camera_alt
-                                  : Icons.camera_enhance_outlined,
-                              color: running
-                                  ? Colors.deepPurple
-                                  : context.textColorTertiary,
-                              size: 18,
+                          : ValueListenableBuilder<bool>(
+                              valueListenable: fm.isRunningNotifier,
+                              builder: (_, running, __) => Icon(
+                                running
+                                    ? Icons.visibility
+                                    : Icons.visibility_off_outlined,
+                                color: running
+                                    ? Colors.deepPurple
+                                    : context.textColorTertiary,
+                                size: 18,
+                              ),
                             ),
                       const SizedBox(width: 10),
                       Expanded(
                         child: ValueListenableBuilder<String>(
-                          valueListenable: detector.faceMonitor.statusText,
-                          builder: (context, status, child) {
-                            return Text(
-                              _initializingFace
-                                  ? 'Initializing…'
-                                  : status,
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: running
-                                    ? Colors.deepPurple
-                                    : context.textColorSecondary,
-                              ),
-                            );
-                          },
+                          valueListenable: fm.statusText,
+                          builder: (_, status, __) => Text(
+                            _initializingFace ? 'Initialising…' : status,
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: fm.isRunning
+                                  ? Colors.deepPurple
+                                  : context.textColorSecondary,
+                            ),
+                          ),
                         ),
                       ),
                     ],
                   ),
                 ),
-                Switch(
-                  value: running,
-                  activeColor: Colors.deepPurple,
-                  onChanged: _initializingFace
-                      ? null
-                      : (bool value) async {
-                          if (value) {
-                            if (!detector.faceMonitor.isInitialized) {
-                              setState(() => _initializingFace = true);
-                              final db    = ref.read(appDatabaseProvider);
-                              final dayId = ref.read(todayDayIdProvider);
-                              await detector.faceMonitor.initialize(
-                                soundPath:
-                                    r'c:\Users\royal\Desktop\Productive\Phone_Sound_Effect.mp3',
-                                dayId: dayId,
-                                onPhoneDetectedCallback: (snapPath, reason) {
-                                  db.addHallOfShameEntry(
-                                    dayId: dayId,
-                                    screenshotPath: snapPath,
-                                    reason: reason,
-                                  );
-                                },
-                              );
-                              if (mounted)
-                                setState(() => _initializingFace = false);
+                ValueListenableBuilder<bool>(
+                  valueListenable: fm.isRunningNotifier,
+                  builder: (_, running, __) => Switch(
+                    value: running,
+                    activeColor: Colors.deepPurple,
+                    onChanged: _initializingFace || locked
+                        ? null
+                        : (bool value) async {
+                            if (value) {
+                              if (!fm.isInitialized) {
+                                setState(() => _initializingFace = true);
+                                final db    = ref.read(appDatabaseProvider);
+                                final dayId = ref.read(todayDayIdProvider);
+                                await fm.initialize(
+                                  soundPath: r'c:\Users\royal\Desktop\Productive\Phone_Sound_Effect.mp3',
+                                  dayId: dayId,
+                                  onPhoneDetectedCallback: (reason) {
+                                    db.addHallOfShameEntry(
+                                      dayId: dayId,
+                                      screenshotPath:
+                                          'face_${DateTime.now().millisecondsSinceEpoch}.log',
+                                      reason: reason,
+                                    );
+                                  },
+                                );
+                                if (mounted) {
+                                  setState(() => _initializingFace = false);
+                                }
+                              }
+                              if (fm.isInitialized) {
+                                await fm.start(forceReconnect: true);
+                              }
+                            } else {
+                              fm.stop();
                             }
-                            if (detector.faceMonitor.isInitialized) {
-                              await detector.faceMonitor.start();
-                              if (mounted) setState(() {});
-                            }
-                          } else {
-                            detector.faceMonitor.stop();
-                            if (mounted) setState(() {});
-                          }
-                        },
+                          },
+                  ),
                 ),
               ],
             ),
-            if (running)
-              Padding(
-                padding: const EdgeInsets.only(top: 10),
-                child: Row(
+            ValueListenableBuilder<bool>(
+              valueListenable: fm.isRunningNotifier,
+              builder: (_, running, __) {
+                if (!running) return const SizedBox.shrink();
+                return Column(
                   children: [
-                    ValueListenableBuilder<int>(
-                      valueListenable: detector.faceMonitor.snapCount,
-                      builder: (context, count, _) {
-                        return Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 8, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: Colors.grey.shade200,
-                            borderRadius: BorderRadius.circular(12),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        ValueListenableBuilder<int>(
+                          valueListenable: fm.snapCount,
+                          builder: (_, count, __) => _monitorChip(
+                            label: '$count distractions',
+                            color: count > 0 ? Colors.red : Colors.green,
                           ),
-                          child: Text(
-                            '$count phone detections',
-                            style: TextStyle(
-                                fontSize: 11,
-                                color: context.textColorSecondary),
+                        ),
+                        const SizedBox(width: 8),
+                        ValueListenableBuilder<int>(
+                          valueListenable: fm.focusScore,
+                          builder: (_, score, __) => _monitorChip(
+                            label: 'Focus $score%',
+                            color: score >= 75
+                                ? Colors.green
+                                : score >= 50
+                                    ? Colors.orange
+                                    : Colors.red,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        _monitorChip(
+                            label: 'FaceMesh + Gaze',
+                            color: Colors.deepPurple),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    ValueListenableBuilder<Uint8List?>(
+                      valueListenable: fm.previewFrame,
+                      builder: (_, frameBytes, __) {
+                        return Center(
+                          child: SizedBox(
+                            width: 180,
+                            height: 180,
+                            child: frameBytes == null
+                                ? Container(
+                                    alignment: Alignment.center,
+                                    decoration: BoxDecoration(
+                                      color: Colors.black.withValues(alpha: 0.05),
+                                      borderRadius: BorderRadius.circular(12),
+                                      border: Border.all(color: Colors.white10),
+                                    ),
+                                    child: const CircularProgressIndicator(),
+                                  )
+                                : ClipRRect(
+                                    borderRadius: BorderRadius.circular(12),
+                                    child: Image.memory(
+                                      frameBytes,
+                                      width: 180,
+                                      height: 180,
+                                      fit: BoxFit.cover,
+                                      gaplessPlayback: true,
+                                    ),
+                                  ),
                           ),
                         );
                       },
                     ),
-                    const SizedBox(width: 8),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 4),
-                      decoration: BoxDecoration(
-                        color:
-                            Colors.deepPurple.withValues(alpha: 0.08),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: const Text(
-                        'MediaPipe + OpenCV',
-                        style: TextStyle(
-                            fontSize: 11, color: Colors.deepPurple),
-                      ),
-                    ),
                   ],
-                ),
-              ),
+                );
+              },
+            ),
           ],
         ),
       ),
     );
   }
 
-  // ── Interval Slider ─────────────────────────────────────────────────────────
+  Widget _monitorChip({required String label, required Color color}) {
+    return Container(
+      padding:
+          const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withValues(alpha: 0.25)),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+            fontSize: 11,
+            color: color,
+            fontWeight: FontWeight.w600),
+      ),
+    );
+  }
 
   Widget _buildIntervalSlider(
-      BuildContext context, int interval, ViolationDetector detector) {
+      BuildContext context, int interval, bool locked, ViolationDetector detector) {
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -737,11 +796,13 @@ class _MonitorSettingsScreenState
               max: 60,
               divisions: 10,
               label: '${interval}s',
-              onChanged: (v) {
-                ref.read(monitorIntervalProvider.notifier).state =
-                    v.toInt();
-                detector.setInterval(v.toInt());
-              },
+              onChanged: locked
+                  ? null
+                  : (v) {
+                      ref.read(monitorIntervalProvider.notifier).state =
+                          v.toInt();
+                      detector.setInterval(v.toInt());
+                    },
             ),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -759,8 +820,6 @@ class _MonitorSettingsScreenState
       ),
     );
   }
-
-  // ── What Is Blocked ─────────────────────────────────────────────────────────
 
   Widget _buildWhatIsBlocked(BuildContext context, AppBlocker blocker) {
     final ytKeywords = blocker.activeYouTubeKeywords.take(8).toList();
@@ -795,6 +854,8 @@ class _MonitorSettingsScreenState
               runSpacing: 6,
               children: [
                 'Instagram',
+                'LinkedIn',
+                'WhatsApp',
                 'X / Twitter',
                 'Facebook',
                 'Snapchat',
