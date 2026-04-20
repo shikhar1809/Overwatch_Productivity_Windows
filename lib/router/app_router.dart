@@ -5,6 +5,7 @@ import 'package:go_router/go_router.dart';
 import '../features/morning/morning_screen.dart';
 import '../features/monitor/monitor_settings_screen.dart';
 import '../features/planner/planner_screen.dart';
+import '../features/settings/settings_screen.dart';
 import '../features/shell/app_shell.dart';
 import '../features/session/session_screen.dart';
 import '../features/hall_of_shame/hall_of_shame_screen.dart';
@@ -72,6 +73,17 @@ final appRouterProvider = Provider<GoRouter>((ref) {
                 name: 'stats',
                 pageBuilder: (context, state) => const NoTransitionPage<void>(
                   child: StatsScreen(),
+                ),
+              ),
+            ],
+          ),
+          StatefulShellBranch(
+            routes: [
+              GoRoute(
+                path: '/settings',
+                name: 'settings',
+                pageBuilder: (context, state) => const NoTransitionPage<void>(
+                  child: SettingsScreen(),
                 ),
               ),
             ],

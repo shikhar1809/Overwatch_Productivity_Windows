@@ -57,6 +57,7 @@ class _AppShellState extends ConsumerState<AppShell> {
     _NavSpec('Session', Icons.timer_outlined, '/session'),
     _NavSpec('OverWatch', Icons.visibility_outlined, '/monitor'),
     _NavSpec('Stats', Icons.bar_chart_outlined, '/stats'),
+    _NavSpec('Settings', Icons.settings_outlined, '/settings'),
   ];
 
   @override
