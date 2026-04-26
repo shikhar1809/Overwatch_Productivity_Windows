@@ -78,36 +78,39 @@ class FaceMonitorService {
     String? dayId,
     void Function(String reason)? onPhoneDetectedCallback,
   }) async {
-    // Always update the callback — even if already initialised.
-    // This fixes the bug where toggling the monitor manually from Settings
-    // would set _initialized=true with NO callback, and any later call from
-    // SessionScreen would hit the early-return and never wire up the callback.
+    debugPrint('FaceMonitor: initialize called');
+    
+    // Always update the callback
     if (onPhoneDetectedCallback != null) {
       onPhoneDetected = onPhoneDetectedCallback;
     }
 
-    if (_initialized) return true;  // heavy setup only once
+    if (_initialized) {
+      debugPrint('FaceMonitor: already initialized');
+      return true;
+    }  
 
     _soundPath = soundPath;
 
-    // Verify the Python sidecar script exists
     final scriptPath = _sidecarPath();
     final scriptFile = File(scriptPath);
+    debugPrint('FaceMonitor: checking path: $scriptPath');
     if (!scriptFile.existsSync()) {
-      statusText.value = 'Sidecar not found: $scriptPath';
+      statusText.value = 'Sidecar not found';
       debugPrint('FaceMonitor: sidecar missing at $scriptPath');
       return false;
     }
+    debugPrint('FaceMonitor: sidecar found');
 
     _initialized = true;
-    statusText.value = 'Ready — tap toggle to start';
-    debugPrint('FaceMonitor: initialized. Sidecar: $scriptPath');
+    statusText.value = 'Ready';
+    debugPrint('FaceMonitor: initialized successfully');
     return true;
   }
 
   // ── start ──────────────────────────────────────────────────────────────────
 
-  Future<void> start({bool forceReconnect = false}) async {
+Future<void> start({bool forceReconnect = false}) async {
     if (!_initialized) return;
 
     // Check if sidecar is dead and needs restart
@@ -122,6 +125,11 @@ class FaceMonitorService {
       }
     }
 
+    // If not already running or needs restart, start it
+    if (!needsRestart && isRunningNotifier.value) {
+      return;
+    }
+
     _isRunning    = true;
     _alarmPlaying = false;
     isRunningNotifier.value = true;
@@ -129,6 +137,7 @@ class FaceMonitorService {
     sessionLogs.value = [];
     snapCount.value   = 0;
     statusText.value  = 'Starting sidecar…';
+    debugPrint('FaceMonitor: attempting to start sidecar...');
 
     // Kill any existing zombie
     if (_sidecar != null) {
@@ -142,6 +151,12 @@ class FaceMonitorService {
         runInShell: true,
       );
 
+      debugPrint('FaceMonitor: sidecar process started (pid ${_sidecar!.pid})');
+      
+      // Wait a moment then send ARM command
+      await Future.delayed(const Duration(milliseconds: 500));
+      _sendArm();
+
       // stdout → JSON events
       _stdoutSub = _sidecar!.stdout
           .transform(utf8.decoder)
@@ -154,10 +169,10 @@ class FaceMonitorService {
           .transform(const LineSplitter())
           .listen((line) => debugPrint('[sidecar stderr] $line'));
 
-      debugPrint('FaceMonitor: sidecar process started (pid ${_sidecar!.pid})');
+      debugPrint('FaceMonitor: sidecar fully started');
     } catch (e) {
       debugPrint('FaceMonitor: failed to start sidecar: $e');
-      statusText.value = 'Error starting sidecar: $e';
+      statusText.value = 'Error: $e';
       _isRunning = false;
       isRunningNotifier.value = false;
     }
@@ -220,8 +235,24 @@ class FaceMonitorService {
   void _onSidecarDone() {
     debugPrint('FaceMonitor: sidecar stdout closed');
     if (_isRunning) {
-      statusText.value = 'Sidecar disconnected';
+      statusText.value = 'Sidecar disconnected - tap to reconnect';
       _isRunning = false;
+      isRunningNotifier.value = false;
+      
+      // Try to restart if monitor is enabled
+      if (_isRunning && !_initialized) {
+        _tryRestartSidecar();
+      }
+    }
+  }
+  
+  Future<void> _tryRestartSidecar() async {
+    if (_initialized) {
+      try {
+        start(forceReconnect: true);
+      } catch (e) {
+        debugPrint('FaceMonitor: restart failed: $e');
+      }
     }
   }
 

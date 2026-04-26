@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 import '../../data/providers.dart';
 
@@ -115,26 +114,11 @@ class _AppShellState extends ConsumerState<AppShell> {
                 ),
                 Padding(
                   padding: const EdgeInsets.only(bottom: 8.0),
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(4),
-                    onTap: () => launchUrl(Uri.parse('https://www.linkedin.com/in/shikhar-shahi-7934a327a/')),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 8.0),
-                      child: RotatedBox(
-                        quarterTurns: -1,
-                        child: RichText(
-                          text: TextSpan(
-                            text: 'Built by ',
-                            style: TextStyle(fontSize: 12, color: isDark ? Colors.white54 : Colors.grey),
-                            children: [
-                              TextSpan(
-                                text: 'Shikhar Shahi',
-                                style: TextStyle(fontSize: 12, color: isDark ? Colors.amber : Colors.blue, fontWeight: FontWeight.bold, decoration: TextDecoration.underline),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
+                  child: RotatedBox(
+                    quarterTurns: -1,
+                    child: Text(
+                      'Built by Shikhar Shahi',
+                      style: TextStyle(fontSize: 9, color: isDark ? Colors.white54 : Colors.grey),
                     ),
                   ),
                 ),

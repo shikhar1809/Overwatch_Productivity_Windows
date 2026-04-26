@@ -238,6 +238,12 @@ class FaceMonitor:
 
         face_present = (face_result.multi_face_landmarks is not None
                         and len(face_result.multi_face_landmarks) > 0)
+        
+        hands_present = (hand_result.multi_hand_landmarks is not None
+                        and len(hand_result.multi_hand_landmarks) > 0)
+
+        # No human = no face AND no hands (truly absent, not just looking down)
+        human_present = face_present or hands_present
 
         with self._lock:
             if not self._armed:
@@ -251,33 +257,34 @@ class FaceMonitor:
                 score, logs = self._compute_score_and_logs()
                 emit({"event": "FOCUS_SCORE", "score": score, "logs": logs})
 
-            # ── no-face tracking ─────────────────────────────────────────────
-            if not face_present:
-                cv2.putText(annotated, "NO FACE DETECTED", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+# ── no-human tracking ─────────────────────────────────────────────
+            if not human_present:
+
                 if self._face_was_present or self._no_face_start is None:
                     self._no_face_start    = now
-                    self._face_was_present = False
 
                 absence = now - self._no_face_start
+
                 if absence >= NO_FACE_THRESHOLD and not self._no_face_fired:
                     self._no_face_fired       = True
                     self._no_face_event_start = now
                     ts = _timestamp()
-                    self._logs.append({"ts": ts, "event": "no_face",
-                                       "msg": "Left desk / not visible"})
+                    self._logs.append({"ts": ts, "event": "no_human",
+                                       "msg": "No human present"})
                     emit({"event": "NO_FACE", "seconds": round(absence, 1)})
-                return annotated
 
-            # face returned
-            if self._no_face_fired:
+            # human returned
+            elif human_present:
+                self._face_was_present = True
                 if self._no_face_event_start is not None:
                     self._no_face_secs += now - self._no_face_event_start
                     self._no_face_event_start = None
                 emit({"event": "FACE_BACK"})
                 self._no_face_fired = False
-            self._no_face_start    = None
+                self._no_face_start = None
             self._face_was_present = True
+
+            # Continue with phone detection
 
             # ── distraction detection ────────────────────────────────────────
             face_lm = face_result.multi_face_landmarks[0].landmark
@@ -532,14 +539,11 @@ class FaceMonitor:
                 return False, pitch_s, gaze_s, yaw_ratio, "none"
 
             # ── Determine cause ───────────────────────────────────────────────
-            gaze_distracted = head_pitched_down and gaze_down
+            # Gaze and yaw tracking disabled - only phone detection matters
             cause = "none"
-            if gaze_distracted:
-                cause = "gaze_pitch"
-            elif yaw_distracted:
-                cause = "head_yaw"
+            distracted = False
 
-            return (gaze_distracted or yaw_distracted), pitch_s, gaze_s, yaw_ratio, cause
+            return distracted, pitch_s, gaze_s, yaw_ratio, cause
 
         except Exception:
             return False, 0.0, 0.5, 0.5, "error"

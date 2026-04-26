@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../blocking/blocking_constants.dart';
@@ -23,6 +24,30 @@ class UnhookService {
     return daysSinceVerification >= 7;
   }
 
+  Future<bool> checkChromeWithUnhook() async {
+    if (!Platform.isWindows) return false;
+    
+    try {
+      final result = await Process.run('powershell', [
+        '-Command',
+        '''
+        \$chrome = Get-Process chrome -ErrorAction SilentlyContinue
+        if (\$chrome) {
+          \$ext = (Get-ItemProperty "HKCU:\\SOFTWARE\\Google\\Chrome\\Extensions\\jpfpebmajhhopehlkelmimbodnpnlihg" -ErrorAction SilentlyContinue)
+          if (\$ext) { Write-Output "enabled" } else { Write-Output "disabled" }
+        } else {
+          Write-Output "not_running"
+        }
+        '''
+      ]);
+      
+      final output = result.stdout.toString().trim().toLowerCase();
+      return output == 'enabled';
+    } catch (e) {
+      return false;
+    }
+  }
+
   String get installInstructions {
     return '''
 To enable YouTube access:
@@ -46,6 +71,11 @@ Note: Unhook helps you stay focused by removing distractions from YouTube.
 
 final unhookServiceProvider = Provider<UnhookService>((ref) {
   return UnhookService();
+});
+
+final chromeUnhookEnabledProvider = FutureProvider<bool>((ref) async {
+  final service = ref.watch(unhookServiceProvider);
+  return service.checkChromeWithUnhook();
 });
 
 class UnlockSession {
